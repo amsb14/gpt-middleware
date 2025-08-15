@@ -3,3 +3,4 @@ uvicorn
 boto3
 httpx
 python-multipart
+duckdb
