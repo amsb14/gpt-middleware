@@ -16,7 +16,7 @@ R2_ACCOUNT = os.getenv("R2_ACCOUNT_ID")
 R2_BUCKET = os.getenv("R2_BUCKET")
 SIGN_TTL = int(os.getenv("R2_SIGN_TTL", "3600"))  # longer TTL for big scans
 
-CATALOG_KEY = os.getenv("CATALOG_KEY", "catalog/catalog.json")  # where the tiny catalog lives
+CATALOG_KEY = os.getenv("CATALOG_KEY", "catalog.json")  # where the tiny catalog lives
 
 # ================== R2 CLIENT ==================
 s3 = boto3.client(
