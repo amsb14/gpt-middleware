@@ -15,7 +15,13 @@ s3 = boto3.client(
     aws_secret_access_key=R2_SECRET,
 )
 
-app = FastAPI(title="R2 Proxy", version="1.0.0")
+app = FastAPI(
+    title="R2 Proxy",
+    version="1.0.0",
+    servers=[
+        {"url": "https://gpt-middleware-gvo9.onrender.com", "description": "Render deployment"}
+    ]
+)
 
 app.add_middleware(
     CORSMiddleware,
