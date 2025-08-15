@@ -1,22 +1,21 @@
 import os
-import io
 import json
-from typing import List, Optional, Literal, Dict, Any
+from typing import Any, List, Optional, Literal
 
 import boto3
 import duckdb
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, conint
 
 # ================== ENV ==================
 R2_KEY = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_ACCOUNT = os.getenv("R2_ACCOUNT_ID")
 R2_BUCKET = os.getenv("R2_BUCKET")
-SIGN_TTL = int(os.getenv("R2_SIGN_TTL", "3600"))  # longer TTL for big scans
-
-CATALOG_KEY = os.getenv("CATALOG_KEY", "catalog.json")  # where the tiny catalog lives
+SIGN_TTL = int(os.getenv("R2_SIGN_TTL", "3600"))  # signed URL TTL
+CATALOG_KEY = os.getenv("CATALOG_KEY", "catalog.json")  # location in bucket
 
 # ================== R2 CLIENT ==================
 s3 = boto3.client(
@@ -50,12 +49,12 @@ app = FastAPI(
     title="R2 Data Gateway",
     version="2.0.0",
     servers=[{"url": "https://gpt-middleware-gvo9.onrender.com", "description": "Render deployment"}],
-    description="Generic, schema-agnostic query gateway for large CSV/Parquet in R2, designed for ChatGPT Actions."
+    description="Generic, schema-agnostic query gateway for large CSV/Parquet in R2."
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # lock down to chat.openai.com in prod if you prefer
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -63,17 +62,15 @@ app.add_middleware(
 # ================== DUCKDB ==================
 def new_conn():
     con = duckdb.connect()
-    # HTTP/Parquet performance knobs
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("SET enable_http_metadata_cache=true;")
     con.execute("SET http_metadata_cache_max_entries=20000;")
-    # Reasonable parallelism by default
     con.execute("PRAGMA threads=%d" % max(2, os.cpu_count() or 4))
     return con
 
 # ================== HELPERS ==================
-def load_catalog() -> Dict[str, Any]:
+def load_catalog() -> dict:
     txt = r2_get_text(CATALOG_KEY)
     if not txt:
         return {}
@@ -90,20 +87,16 @@ def normalize_cols(df, case: Literal["lower","preserve"]="lower"):
     return df
 
 def quote_ident(name: str) -> str:
-    # Minimal identifier quoting
     return '"' + name.replace('"', '""') + '"'
 
 def read_table_sql(url: str, fmt: Optional[str], coerce: Literal["all_varchar","auto"]="auto") -> str:
-    # Return a table expression for DuckDB
-    # Prefer Parquet scan if extension/format suggests it
     if fmt == "parquet" or (fmt is None and url.lower().endswith(".parquet")):
         return f"parquet_scan('{url}')"
-    # CSV fallback
     if coerce == "all_varchar":
         return f"read_csv_auto('{url}', HEADER=TRUE, ALL_VARCHAR=TRUE)"
     return f"read_csv_auto('{url}', HEADER=TRUE)"
 
-def build_filter_sql(f: Dict[str, Any]) -> str:
+def build_filter_sql(f: dict) -> str:
     col = quote_ident(f["col"])
     op = f.get("op", "=").upper().strip()
     val = f.get("value")
@@ -120,14 +113,13 @@ def build_filter_sql(f: Dict[str, Any]) -> str:
         a_sql = str(a) if isinstance(a, (int, float)) else "'" + str(a).replace("'", "''") + "'"
         b_sql = str(b) if isinstance(b, (int, float)) else "'" + str(b).replace("'", "''") + "'"
         return f"{col} BETWEEN {a_sql} AND {b_sql}"
-    # default scalar
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         v_sql = str(val)
     else:
         v_sql = "'" + str(val).replace("'", "''") + "'"
     return f"{col} {op} {v_sql}"
 
-def ensure_order_by(select_cols: List[str], order_by: Optional[List[Dict[str,str]]]) -> str:
+def ensure_order_by(select_cols: List[str], order_by: Optional[List[dict]]) -> str:
     if order_by:
         parts = []
         for ob in order_by:
@@ -137,10 +129,43 @@ def ensure_order_by(select_cols: List[str], order_by: Optional[List[Dict[str,str
                 d = "ASC"
             parts.append(f"{c} {d}")
         return " ORDER BY " + ", ".join(parts)
-    # fallback to first column for determinism if exists
     if select_cols:
         return " ORDER BY " + quote_ident(select_cols[0]) + " ASC"
     return ""
+
+# ================== Pydantic models ==================
+class PreviewRequest(BaseModel):
+    datasets: List[str] = Field(..., description="Catalog names or raw R2 keys")
+    limit: conint(ge=1, le=2000) = Field(100)
+    coerce: Literal["all_varchar", "auto"] = Field("all_varchar")
+    columns_case: Literal["lower", "preserve"] = Field("lower")
+
+class Filter(BaseModel):
+    col: str
+    op: Literal["=", "!=", ">", ">=", "<", "<=", "IN", "NOT IN", "LIKE", "BETWEEN"] = "="
+    value: Any
+
+class OrderBy(BaseModel):
+    col: str
+    dir: Literal["asc", "desc"] = "asc"
+
+class Aggregation(BaseModel):
+    alias: str
+    expr: str
+
+class QueryRequest(BaseModel):
+    datasets: List[str] = Field(..., description="Catalog names or raw R2 keys")
+    mode: Literal["union", "join"] = "union"
+    on: List[str] = Field(default_factory=list)
+    select: List[str] = Field(default_factory=list)
+    filters: List[Filter] = Field(default_factory=list)
+    aggregations: List[Aggregation] = Field(default_factory=list)
+    group_by: List[str] = Field(default_factory=list)
+    order_by: Optional[List[OrderBy]] = None
+    page: conint(ge=1) = 1
+    page_size: conint(ge=1, le=10_000) = 1000
+    coerce: Literal["all_varchar", "auto"] = "auto"
+    columns_case: Literal["lower", "preserve"] = "lower"
 
 # ================== BASIC ROUTES ==================
 @app.get("/health")
@@ -168,27 +193,10 @@ def get_file(name: str):
 @app.get("/catalog")
 def get_catalog():
     cat = load_catalog()
-    # Optionally enrich with last_modified/size for the first key
-    for ds, meta in cat.items():
-        keys = meta.get("keys", [])
-        if keys:
-            try:
-                # cheap-enrich: only first key
-                for f in r2_list(keys[0].rsplit("/",1)[0] if "/" in keys[0] else ""):
-                    if f["name"] == keys[0]:
-                        meta["first_key_size"] = f["size"]
-                        meta["first_key_last_modified"] = f["last_modified"]
-                        break
-            except Exception:
-                pass
     return {"datasets": cat}
 
 @app.get("/schema")
 def schema(source: str, coerce: Literal["all_varchar","auto"]="all_varchar"):
-    """
-    source can be a catalog dataset name or a raw R2 key.
-    Returns column names/types (types are best-effort for CSV).
-    """
     cat = load_catalog()
     fmt = None
     urls = []
@@ -212,22 +220,13 @@ def schema(source: str, coerce: Literal["all_varchar","auto"]="all_varchar"):
     finally:
         con.close()
 
-# ================== PREVIEW (multi-format) ==================
+# ================== PREVIEW ==================
 @app.post("/preview")
-def preview(body: Dict[str, Any] = Body(...)):
-    """
-    body = {
-      "datasets": ["income_statements", "balance_summaries"] or R2 keys,
-      "limit": 100,
-      "coerce": "all_varchar"|"auto",
-      "columns_case": "lower"|"preserve"
-    }
-    """
-    datasets: List[str] = body.get("datasets", [])
-    limit: int = max(1, min(int(body.get("limit", 100)), 2000))
-    coerce: Literal["all_varchar","auto"] = body.get("coerce","all_varchar")
-    case: Literal["lower","preserve"] = body.get("columns_case","lower")
-
+def preview(body: PreviewRequest):
+    datasets = body.datasets
+    limit = body.limit
+    coerce = body.coerce
+    case = body.columns_case
     if not datasets:
         raise HTTPException(400, "datasets is required")
 
@@ -237,14 +236,13 @@ def preview(body: Dict[str, Any] = Body(...)):
         if ds in cat:
             fmt = cat[ds].get("format")
             for k in cat[ds].get("keys", []):
-                items.append((read_table_sql(r2_signed_url(k), fmt, coerce), cat[ds].get("aliases", {})))
+                items.append(read_table_sql(r2_signed_url(k), fmt, coerce))
         else:
-            items.append((read_table_sql(r2_signed_url(ds), None, coerce), {}))
+            items.append(read_table_sql(r2_signed_url(ds), None, coerce))
 
     con = new_conn()
     try:
-        # Build UNION BY NAME preview
-        union_sql = " UNION BY NAME ALL ".join([f"SELECT * FROM {t}" for t, _ in items])
+        union_sql = " UNION BY NAME ALL ".join([f"SELECT * FROM {t}" for t in items])
         q = f"SELECT * FROM ({union_sql}) LIMIT {limit}"
         df = con.execute(q).df()
         df = normalize_cols(df, case)
@@ -254,66 +252,40 @@ def preview(body: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-# ================== GENERIC QUERY ==================
+# ================== QUERY ==================
 @app.post("/query")
-def query(body: Dict[str, Any] = Body(...)):
-    """
-    Generic, schema-agnostic query.
-
-    Example body:
-    {
-      "datasets": ["income_statements", "finance/prices_2024.parquet"],
-      "mode": "union",   // "union" or "join"
-      "on": ["ticker","date"], // for join
-      "select": ["ticker","date","eps","revenue"],
-      "filters": [{"col":"date","op":">=","value":"2021-01-01"}, {"col":"ticker","op":"IN","value":["AAPL","MSFT"]}],
-      "aggregations": [{"alias":"avg_eps","expr":"avg(eps)"}],
-      "group_by": ["ticker"],
-      "order_by": [{"col":"ticker","dir":"asc"}],
-      "page": 1,
-      "page_size": 500,
-      "coerce": "auto",            // or "all_varchar" for messy CSV
-      "columns_case": "lower"      // or "preserve"
-    }
-    """
+def query(body: QueryRequest):
     cat = load_catalog()
-
-    datasets: List[str] = body.get("datasets", [])
-    mode: Literal["union","join"] = body.get("mode", "union")
-    on_keys: List[str] = body.get("on", [])
-    select_cols: List[str] = body.get("select", [])
-    filters: List[Dict[str, Any]] = body.get("filters", [])
-    aggs: List[Dict[str, str]] = body.get("aggregations", [])
-    group_by: List[str] = body.get("group_by", [])
-    order_by: Optional[List[Dict[str,str]]] = body.get("order_by", None)
-    page: int = max(1, int(body.get("page", 1)))
-    page_size: int = min(10_000, max(1, int(body.get("page_size", 1000))))
-    coerce: Literal["all_varchar","auto"] = body.get("coerce","auto")
-    case: Literal["lower","preserve"] = body.get("columns_case","lower")
+    datasets = body.datasets
+    mode = body.mode
+    on_keys = body.on
+    select_cols = body.select
+    filters = [f.dict() for f in body.filters]
+    aggs = [a.dict() for a in body.aggregations]
+    group_by = body.group_by
+    order_by = [o.dict() for o in body.order_by] if body.order_by else None
+    page = body.page
+    page_size = body.page_size
+    coerce = body.coerce
+    case = body.columns_case
 
     if not datasets:
         raise HTTPException(400, "datasets is required")
 
-    # Resolve datasets → table expressions and alias maps
     table_exprs: List[str] = []
-    alias_maps: List[Dict[str,str]] = []
     for ds in datasets:
         if ds in cat:
             fmt = cat[ds].get("format")
-            aliases = cat[ds].get("aliases", {})
             keys = cat[ds].get("keys", [])
             if not keys:
                 raise HTTPException(404, f"Catalog entry '{ds}' has no keys")
             for k in keys:
                 table_exprs.append(read_table_sql(r2_signed_url(k), fmt, coerce))
-                alias_maps.append(aliases)
         else:
             table_exprs.append(read_table_sql(r2_signed_url(ds), None, coerce))
-            alias_maps.append({})
 
     con = new_conn()
     try:
-        # Build base relation
         if mode == "union":
             base_sql = " UNION BY NAME ALL ".join([f"SELECT * FROM {t}" for t in table_exprs])
             base_cte = f"base AS ({base_sql})"
@@ -323,31 +295,22 @@ def query(body: Dict[str, Any] = Body(...)):
                 raise HTTPException(400, "join mode requires at least two datasets")
             if not on_keys:
                 raise HTTPException(400, "join mode requires 'on' keys")
-            # Simple left-to-right joins on the provided keys
             join_sql = f"SELECT * FROM {table_exprs[0]} t0 "
             for i, t in enumerate(table_exprs[1:], start=1):
-                on_clause = " AND ".join([f"coalesce(t0.{quote_ident(k)}, t0.{quote_ident(k.lower())}) = coalesce(t{i}.{quote_ident(k)}, t{i}.{quote_ident(k.lower())})" for k in on_keys])
+                on_clause = " AND ".join([f"t0.{quote_ident(k)} = t{i}.{quote_ident(k)}" for k in on_keys])
                 join_sql += f"LEFT JOIN {t} t{i} ON {on_clause} "
             base_cte = f"base AS ({join_sql})"
             from_sql = "FROM base"
         else:
             raise HTTPException(400, "mode must be 'union' or 'join'")
 
-        # Filters
         where_sql = ""
         if filters:
             parts = [build_filter_sql(f) for f in filters]
             where_sql = " WHERE " + " AND ".join(parts)
 
-        # Projection
-        proj_parts = []
-        if select_cols:
-            for c in select_cols:
-                proj_parts.append(quote_ident(c))
-        else:
-            proj_parts = ["*"]
+        proj_parts = [quote_ident(c) for c in select_cols] if select_cols else ["*"]
 
-        # Aggregations / Grouping
         agg_parts = []
         if aggs:
             for a in aggs:
@@ -356,22 +319,18 @@ def query(body: Dict[str, Any] = Body(...)):
                 agg_parts.append(f"{expr} AS {alias}")
 
         if aggs and not group_by:
-            # If aggregations exist without group_by, everything collapses to a single row
             select_sql = ", ".join(agg_parts)
         elif aggs and group_by:
             gb_cols = ", ".join([quote_ident(c) for c in group_by])
             proj = ", ".join([quote_ident(c) for c in group_by] + agg_parts)
             group_sql = f" GROUP BY {gb_cols}"
-            # We'll combine later
         else:
             select_sql = ", ".join(proj_parts)
 
-        # Pagination
         order_sql = ensure_order_by(select_cols or group_by, order_by)
         offset = (page - 1) * page_size
         limit_sql = f" LIMIT {page_size} OFFSET {offset}"
 
-        # Final SQL assembly
         if aggs and group_by:
             sql = f"WITH {base_cte} SELECT {proj} {from_sql} {where_sql} {group_sql} {order_sql} {limit_sql}"
         else:
@@ -384,7 +343,7 @@ def query(body: Dict[str, Any] = Body(...)):
             "page": page,
             "page_size": page_size,
             "rows": df.to_dict(orient="records"),
-            "sql": sql  # helpful for debugging; remove in prod if you want
+            "sql": sql
         }
     except Exception as e:
         raise HTTPException(500, f"Error executing query: {e}")
